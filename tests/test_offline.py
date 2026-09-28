@@ -13,6 +13,7 @@ import shutil
 import socket
 import sys
 import tempfile
+import unicodedata
 import unittest
 import urllib.error
 import urllib.request
@@ -41,6 +42,16 @@ def lands_on(final, status=200, body=""):
     def get(url, timeout=15):
         return body, final, status
     return get
+
+
+# A direction override, a zero-width space, and escape sequences in their 8-bit
+# and 7-bit forms. None of them may reach the terminal.
+HIDDEN = ("\u202e", "\u200b", "\x9b8m", "\x1bc")
+
+
+def hidden_in(text):
+    """The control and format characters in text, line breaks aside."""
+    return {f"U+{ord(ch):04X}" for ch in text if ch != "\n" and unicodedata.category(ch).startswith("C")}
 
 
 class BoardUrls(unittest.TestCase):
@@ -257,6 +268,20 @@ class LinksThatRedirect(unittest.TestCase):
             found = listing.employer_domain_from_page("https://go.redirect.example/j/1")
         self.assertEqual(found[0], "acme.example")
 
+    def test_a_linked_host_counts_only_if_it_is_a_hostname(self):
+        page = ("".join(f'<a href="https://acme{h}.example/">Apply</a>' * 3 for h in HIDDEN)
+                + '<a href="https://www.acme.example/">Acme</a>')
+        with mock.patch.object(listing, "get", lands_on("https://jobs.posting.example/p/1", 200, page)):
+            found = listing.employer_domain_from_page("https://jobs.posting.example/p/1")
+        self.assertEqual(found[0], "acme.example")
+
+    def test_a_refused_host_is_named_without_hidden_characters(self):
+        final = "https://x" + "".join(HIDDEN) + ".linkedin.com/in/1"
+        with mock.patch.object(listing, "get", lands_on(final, "refused:not_read")):
+            result = listing.check_listing(url="https://short.example/abc")
+        self.assertEqual(result["error"]["code"], "not_read")
+        self.assertEqual(hidden_in(result["error"]["message"]), set())
+
 
 ACME = {
     "https://acme.example": (200, '<html><body><a href="/careers">Careers</a> Acme makes things.</body></html>'),
@@ -306,6 +331,56 @@ class EndToEnd(unittest.TestCase):
         self.assertEqual(link["url"], "https://www.donotghostme.com/companies?search=Acme+%26+Co")
 
 
+class Printing(unittest.TestCase):
+    """Nothing a page or an API says reaches the terminal as a control or format character."""
+
+    def result(self):
+        """A real result, with hidden characters added to every text the report shows."""
+        bad = "".join(HIDDEN)
+        with mock.patch.object(checks, "get", fake_web(ACME)), \
+             mock.patch.object(listing, "get", fake_web(ACME)), \
+             mock.patch.object(checks.subprocess, "run", return_value=WHOIS):
+            result = listing.check_listing(domain="acme.example", title="Security Analyst")
+        result["employer"].update(domain="acme.example" + bad, company="Acme" + bad)
+        result["role"]["title"] += bad
+        for field in result["fields"].values():
+            field["evidence"] = [e + bad for e in field.get("evidence", [])]
+            if isinstance(field.get("value"), str):
+                field["value"] += bad
+        result["summary"] += bad
+        result["see_also"][0]["about"] += bad
+        result["posting"] = {"ats": "greenhouse", "board": "acme" + bad, "job_id": "7",
+                             "live": None, "api": None, "problem": "timed out" + bad}
+        result["board_match"] = "different"
+        result["employer_boards"] = [{"ats": "lever", "board": "acme" + bad}]
+        return result
+
+    def run_cli(self, argv, result):
+        out = io.StringIO()
+        with mock.patch("reqcheck.cli.check_listing", return_value=result), contextlib.redirect_stdout(out):
+            cli_main(argv)
+        return out.getvalue()
+
+    def test_the_report(self):
+        out = self.run_cli(["--domain", "acme.example"], self.result())
+        self.assertIn("Verifying: Acme8mc", out)
+        self.assertEqual(hidden_in(out), set())
+
+    def test_an_error(self):
+        bad = "".join(HIDDEN)
+        result = {"error": {"code": "not_read", "message": f"x{bad}.linkedin.com is not read automatically."},
+                  "posting": {"ats": "greenhouse", "board": "acme" + bad, "live": True}}
+        out = self.run_cli(["https://x.linkedin.com/jobs/1"], result)
+        self.assertIn("not read automatically", out)
+        self.assertEqual(hidden_in(out), set())
+
+    def test_the_json_escapes_them_and_loses_nothing(self):
+        result = self.result()
+        out = self.run_cli(["--domain", "acme.example", "--json"], result)
+        self.assertEqual(hidden_in(out), set())
+        self.assertEqual(json.loads(out), json.loads(json.dumps(result)))
+
+
 class Store(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix=".reqcheck-test-", dir=Path.home()))
@@ -350,6 +425,18 @@ class Store(unittest.TestCase):
         with contextlib.redirect_stdout(out):
             self.assertEqual(cli_main(["history", "--json"]), 0)
         self.assertEqual(json.loads(out.getvalue()), [])
+
+    def test_cli_history_prints_nothing_hidden(self):
+        bad = "".join(HIDDEN)
+        store.save({"employer": {"domain": "acme.example" + bad}, "role": {"title": "Analyst" + bad},
+                    "fields": {"careers_listing": {"value": "absent" + bad, "status": "measured" + bad}}},
+                   note="mine" + bad)
+        for argv in (["history"], ["history", "--json"]):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(cli_main(argv), 0)
+            self.assertIn("Analyst", out.getvalue())
+            self.assertEqual(hidden_in(out.getvalue()), set(), argv)
 
     def test_cli_note_needs_save(self):
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):

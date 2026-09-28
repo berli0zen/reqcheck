@@ -50,6 +50,8 @@ class _LinkNotRead(Exception):
 def employer_domain_from_page(url):
     """The employer's domain from a readable posting page: the most frequent
     outside host it links to, excluding job boards and the page's own site.
+    Only a valid hostname counts. The page's author writes its links, and a
+    link's host can carry control or format characters.
 
     Returns (domain, how, html) or (None, reason, html). An unknown domain
     returns None. A wrong one would produce results about a company that was
@@ -69,7 +71,7 @@ def employer_domain_from_page(url):
     candidates = []
     for href in re.findall(r'href="(https?://[^"]+)"', html):
         h = host_of(href)
-        if not h or h in own or BOARD_HOSTS.search(h) or not_read_reason(h):
+        if not HOSTNAME_OK.match(h) or h in own or BOARD_HOSTS.search(h) or not_read_reason(h):
             continue
         if re.search(r"(google|facebook|twitter|x\.com|youtube|instagram|"
                      r"cloudflare|gstatic|jquery|cdn)", h, re.I):
@@ -198,7 +200,7 @@ def check_listing(url=None, domain=None, title=None, company=None, followers=Non
         h = host_of(url)
         blocked_reason = not_read_reason(h)
         if blocked_reason and not domain:
-            result["error"] = _not_read(f"{h} is", blocked_reason)
+            result["error"] = _not_read(f"{boards.clean(h, 253)} is", blocked_reason)
             return result
         if not blocked_reason:
             # A posting on a hosted board: the board's own API gives its title and state.
@@ -219,8 +221,9 @@ def check_listing(url=None, domain=None, title=None, company=None, followers=Non
                 except _LinkNotRead as e:
                     landed = e.args[0]
                     if not domain:
-                        result["error"] = _not_read(f"The posting link leads to {landed}, which is",
-                                                    not_read_reason(landed))
+                        result["error"] = _not_read(
+                            f"The posting link leads to {boards.clean(landed, 253)}, which is",
+                            not_read_reason(landed))
                         return result
                     found = found_how = page_html = None
                 if not domain:

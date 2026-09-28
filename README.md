@@ -113,7 +113,10 @@ terms or is blocked. For listings there, pass the domain and title by hand.
 - Responses are read up to 8 MB. Anything larger is reported as unreadable.
 - Board names and posting IDs taken from pages are validated and escaped before use, and the API
   hosts are fixed.
-- Text from remote sources has control and format characters removed before it is printed.
+- Everything the command line prints has control and format characters removed, so text from a
+  page or an API can't rewrite the terminal or disguise a domain. `--json` output is plain ASCII,
+  with every other character escaped.
+- A domain read from a posting page is used only if it's a valid hostname.
 - `whois` receives a validated hostname and is never run through a shell.
 - Saved checks are owner-only files inside the home folder, never written through a symlink.
 

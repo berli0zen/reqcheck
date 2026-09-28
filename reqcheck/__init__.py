@@ -11,7 +11,7 @@ command line in reqcheck.cli, a desktop app or a website. Saved checks live only
 in the user's own home folder (reqcheck.store).
 """
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 from .checks import STATUSES  # noqa: E402
 from .listing import check_listing  # noqa: E402

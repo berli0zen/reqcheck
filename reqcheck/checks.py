@@ -14,7 +14,7 @@ import urllib.parse
 from datetime import date, datetime
 
 from . import boards
-from .fetch import HOSTNAME_OK, get, strip_html
+from .fetch import HOSTNAME_OK, get, not_read_reason, strip_html
 
 CAREER_PATHS = [
     "/careers", "/careers/", "/jobs", "/jobs/", "/join-us", "/join",
@@ -40,6 +40,21 @@ NO_OPENINGS = [
 # Only `measured` and `absent` describe the employer. The rest describe the check.
 STATUSES = ("measured", "absent", "blocked", "unavailable", "not_checked",
             "not_supplied", "not_attempted")
+
+# Requests fetch.get() declines to make, by the status it returns, with the value
+# and evidence a check reports when nothing else was read. None of them is the
+# site refusing, and none says anything about the employer.
+NOT_FETCHED = {
+    "refused:private_address": (
+        "private_address",
+        "The domain resolves to a private or internal address. Those are never fetched."),
+    "refused:plain_http": (
+        "plain_http_only",
+        "The site sends requests to plain HTTP, and pages are only read over HTTPS."),
+    "refused:not_read": (
+        "not_read",
+        "The site is on a platform that is never read automatically."),
+}
 
 # Applicant tracking systems that render listings in the browser. When a careers
 # page is one of these shells, the role list is not in the HTML fetched, and a
@@ -164,8 +179,12 @@ def _harvest(html, base, pattern=CAREER_LINK):
             continue
         if re.search(r"\.(css|js|png|jpe?g|svg|woff2?|ico|xml)$", href, re.I):
             continue
-        url = urllib.parse.urljoin(base + "/", href)
-        if re.search(r"linkedin\.com|indeed\.com|glassdoor\.", url, re.I):
+        try:
+            url = urllib.parse.urljoin(base + "/", href)
+            host = urllib.parse.urlsplit(url).hostname
+        except ValueError:
+            continue  # a malformed address in the page
+        if not_read_reason(host):
             continue
         if url not in out:
             out.append(url)
@@ -278,7 +297,7 @@ def check_careers(site, role):
     blocked = 0
     seen_404 = 0
     unresolved = 0
-    private = 0
+    not_fetched = []
 
     # Discovered links first, fixed paths only as a fallback.
     discovered, ledger = discover_careers_links(base)
@@ -292,8 +311,8 @@ def check_careers(site, role):
         if isinstance(status, str) and status.startswith("dns"):
             unresolved += 1
             continue
-        if status == "refused:private_address":
-            private += 1
+        if status in NOT_FETCHED:
+            not_fetched.append(status)
             continue
         if status in (401, 403, 429) or (isinstance(status, str) and status.startswith("error")):
             blocked += 1
@@ -316,11 +335,10 @@ def check_careers(site, role):
     out["_html"] = page_html
 
     if page_text is None:
-        if private and not seen_404 and not blocked:
-            out["value"] = "private_address"
+        if not_fetched and not seen_404 and not blocked:
+            out["value"], note = NOT_FETCHED[max(NOT_FETCHED, key=not_fetched.count)]
             out["status"] = "unavailable"
-            out["evidence"].append(
-                "The domain resolves to a private or internal address. Those are never fetched.")
+            out["evidence"].append(note)
             return out
         if unresolved and not seen_404 and not blocked:
             out["value"] = "host_unresolved"
@@ -884,7 +902,7 @@ def check_contact(site):
     text = ""
     raw = ""
     blocked = False
-    private = False
+    not_fetched = []
     searched = []
     # Links found on the homepage first, then fixed paths. Contact details often
     # sit one level deeper than any fixed path, such as /legal/privacy.
@@ -905,16 +923,16 @@ def check_contact(site):
         elif status in (401, 403, 429):
             blocked = True
             searched.append(f"{url.replace(base.rstrip(chr(47)), '') or '/'} (refused {status})")
-        elif status == "refused:private_address":
-            private = True
-            searched.append(f"{url.replace(base.rstrip(chr(47)), '') or '/'} (not fetched: private address)")
+        elif status in NOT_FETCHED:
+            not_fetched.append(status)
+            searched.append(f"{url.replace(base.rstrip(chr(47)), '') or '/'} "
+                            f"(not fetched: {NOT_FETCHED[status][0].replace('_', ' ')})")
         else:
             searched.append(f"{url.replace(base.rstrip(chr(47)), '') or '/'} ({status})")
-    if not text.strip() and private and not blocked:
-        out["value"] = "private_address"
+    if not text.strip() and not_fetched and not blocked:
+        out["value"], note = NOT_FETCHED[max(NOT_FETCHED, key=not_fetched.count)]
         out["status"] = "unavailable"
-        out["evidence"].append(
-            "The domain resolves to a private or internal address. Those are never fetched.")
+        out["evidence"].append(note)
         return out
     if not text.strip():
         out["value"] = "unreachable"

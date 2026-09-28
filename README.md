@@ -86,8 +86,8 @@ language. Whatever form a build takes, keep these:
   keeps history in the visitor's browser. A server keeps nothing about its users or what they
   checked.
 - **Keep the private-address block.** It stops a hosted build from being used to reach the network
-  it runs on. A hosted build should also rate-limit, and block internal address ranges at the
-  network level, since DNS can change between the check and the request.
+  it runs on. A hosted build should also rate-limit and block internal address ranges at the
+  network level, as a second layer.
 - **Keep `measured` and `absent` apart from everything else,** and add no score.
 - **Don't automate the platforms under Not read.**
 
@@ -99,13 +99,17 @@ python3 -m unittest discover -s tests
 
 ## Not read
 
-LinkedIn, Indeed, Glassdoor, ZipRecruiter, Built In and Dice. Automated access breaches their terms
-or is blocked. For listings there, pass the domain and title by hand.
+LinkedIn, Indeed, Glassdoor, ZipRecruiter, Built In and Dice, including their country sites,
+LinkedIn's lnkd.in links, and any link that redirects to them. Automated access breaches their
+terms or is blocked. For listings there, pass the domain and title by hand.
 
 ## Security
 
-- Outbound HTTPS only, with certificate verification.
-- Nothing is fetched from a private, loopback or link-local address, including through a redirect.
+- HTTPS only, with certificate verification. A plain `http://` address is read over HTTPS instead,
+  and a site that only serves plain HTTP is reported as unavailable.
+- Nothing is fetched from a private, loopback or link-local address. The check runs on each
+  connection, against the DNS lookup that connection uses, so redirects and DNS answers that change
+  between lookups can't get around it. Proxy settings are ignored for the same reason.
 - Responses are read up to 8 MB. Anything larger is reported as unreadable.
 - Board names and posting IDs taken from pages are validated and escaped before use, and the API
   hosts are fixed.

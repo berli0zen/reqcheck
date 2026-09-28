@@ -15,17 +15,7 @@ import urllib.parse
 from datetime import datetime
 
 from . import __version__, boards, checks
-from .fetch import HOSTNAME_OK, get
-
-# Platforms whose terms prohibit automated access, or which block it. Never read.
-HANDS_OFF = {
-    "linkedin.com": "LinkedIn's User Agreement prohibits automated access",
-    "indeed.com": "Indeed blocks automated clients",
-    "glassdoor.com": "Glassdoor blocks automated clients",
-    "ziprecruiter.com": "ZipRecruiter blocks automated clients",
-    "builtin.com": "Built In serves a CAPTCHA to automated clients",
-    "dice.com": "Dice renders listings in the browser",
-}
+from .fetch import HOSTNAME_OK, get, not_read_reason
 
 # Hosts that belong to a job board or ATS vendor, never to the employer. A
 # posting page's only outside link can be the vendor's own "powered by" link.
@@ -37,10 +27,12 @@ BOARD_HOSTS = re.compile(
 
 
 def host_of(url):
+    """An address's hostname, lowercased and without a leading "www.", or ""."""
     try:
-        return urllib.parse.urlparse(url).netloc.lower().replace("www.", "")
-    except Exception:
+        host = urllib.parse.urlsplit(url or "").hostname or ""
+    except ValueError:
         return ""
+    return host.removeprefix("www.")
 
 
 def clean_domain(value):
@@ -50,22 +42,34 @@ def clean_domain(value):
     return d if HOSTNAME_OK.match(d) else None
 
 
+class _LinkNotRead(Exception):
+    """The posting link leads to a platform that is never read. The argument is
+    the host it leads to."""
+
+
 def employer_domain_from_page(url):
     """The employer's domain from a readable posting page: the most frequent
-    outside host it links to, excluding job boards.
+    outside host it links to, excluding job boards and the page's own site.
 
     Returns (domain, how, html) or (None, reason, html). An unknown domain
     returns None. A wrong one would produce results about a company that was
-    never examined.
+    never examined. Raises _LinkNotRead if the link leads to a platform that is
+    never read.
     """
     html, final, status = get(url)
+    landed = host_of(final)
+    if status == "refused:not_read" or not_read_reason(landed):
+        raise _LinkNotRead(landed)
     if not isinstance(status, int) or status >= 400 or not html:
         return None, f"posting page returned {status}", None
 
+    # A link can redirect, so the page's own site is where it landed as well as
+    # the host the link named.
+    own = {host_of(url), landed}
     candidates = []
     for href in re.findall(r'href="(https?://[^"]+)"', html):
         h = host_of(href)
-        if not h or BOARD_HOSTS.search(h) or host_of(url) == h:
+        if not h or h in own or BOARD_HOSTS.search(h) or not_read_reason(h):
             continue
         if re.search(r"(google|facebook|twitter|x\.com|youtube|instagram|"
                      r"cloudflare|gstatic|jquery|cdn)", h, re.I):
@@ -154,12 +158,20 @@ def see_also(name):
     }]
 
 
+def _not_read(subject, reason):
+    """The error for a platform that is never read."""
+    parts = [f"{subject} not read automatically.", f"{reason}." if reason else "",
+             "Pass the employer's domain and the title by hand."]
+    return {"code": "not_read", "message": " ".join(p for p in parts if p)}
+
+
 def check_listing(url=None, domain=None, title=None, company=None, followers=None, employees=None):
     """Check one listing. Give a posting URL, or the employer's domain and a title.
 
     Returns a dict. On a problem with the input, `error` holds {code, message}
-    and no checks were run: "not_read" (a platform that is never read), "no_domain"
-    (the employer's domain could not be identified), "invalid_domain" or "no_input".
+    and no checks were run: "not_read" (a platform that is never read, named by
+    the link or reached through it), "no_domain" (the employer's domain could
+    not be identified), "invalid_domain" or "no_input".
     """
     result = {
         "reqcheck_version": __version__,
@@ -184,11 +196,9 @@ def check_listing(url=None, domain=None, title=None, company=None, followers=Non
 
     if url:
         h = host_of(url)
-        blocked_reason = next((v for k, v in HANDS_OFF.items() if k in h), None)
+        blocked_reason = not_read_reason(h)
         if blocked_reason and not domain:
-            result["error"] = {"code": "not_read",
-                               "message": f"{h} is not read automatically. {blocked_reason}. "
-                                          "Pass the employer's domain and the title by hand."}
+            result["error"] = _not_read(f"{h} is", blocked_reason)
             return result
         if not blocked_reason:
             # A posting on a hosted board: the board's own API gives its title and state.
@@ -204,7 +214,15 @@ def check_listing(url=None, domain=None, title=None, company=None, followers=Non
                 if site:
                     domain, how = site, "the website given on the employer's Workable account"
             if not domain or not title:
-                found, found_how, page_html = employer_domain_from_page(url)
+                try:
+                    found, found_how, page_html = employer_domain_from_page(url)
+                except _LinkNotRead as e:
+                    landed = e.args[0]
+                    if not domain:
+                        result["error"] = _not_read(f"The posting link leads to {landed}, which is",
+                                                    not_read_reason(landed))
+                        return result
+                    found = found_how = page_html = None
                 if not domain:
                     domain, how = found, found_how
                 if not title:

@@ -10,9 +10,12 @@ import io
 import json
 import os
 import shutil
+import socket
 import sys
 import tempfile
 import unittest
+import urllib.error
+import urllib.request
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -30,6 +33,13 @@ def fake_web(pages):
     def get(url, timeout=15):
         status, body = pages.get(url, (404, ""))
         return (body if status == 200 else ""), url, status
+    return get
+
+
+def lands_on(final, status=200, body=""):
+    """A get() whose every request ends at `final`, as if a redirect led there."""
+    def get(url, timeout=15):
+        return body, final, status
     return get
 
 
@@ -130,6 +140,54 @@ class Network(unittest.TestCase):
         self.assertEqual(fetch.get("file:///etc/passwd")[2], "invalid:url")
         self.assertEqual(fetch.get("ftp://acme.example/")[2], "invalid:url")
 
+    def test_address_is_checked_on_the_connection_itself(self):
+        # A DNS answer that is public for the first lookup and loopback for the
+        # next (DNS rebinding) must never reach the loopback address.
+        answers = []
+
+        def rebinding(host, port, *args, **kwargs):
+            answers.append(host)
+            ip = "93.184.215.14" if len(answers) == 1 else "127.0.0.1"
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, port or 0))]
+
+        with mock.patch("socket.getaddrinfo", rebinding):
+            self.assertEqual(fetch.get("https://rebind.example/")[2], "refused:private_address")
+        self.assertEqual(len(answers), 2)
+
+    def test_plain_http_is_read_over_https(self):
+        sent = []
+
+        class Recorder:
+            def open(self, req, timeout):
+                sent.append(req.full_url)
+                raise urllib.error.URLError(OSError("offline"))
+
+        with mock.patch.object(fetch, "is_public", return_value=True), \
+             mock.patch.object(fetch, "_OPENER", Recorder()):
+            fetch.get("http://www.acme.example/careers")
+            fetch.get("http://www.acme.example:80/jobs?page=2")
+        self.assertEqual(sent, ["https://www.acme.example/careers", "https://www.acme.example/jobs?page=2"])
+
+    def test_redirects(self):
+        handler = fetch._CheckedRedirects()
+        page = urllib.request.Request("https://www.acme.example/jobs")
+        onward = handler.redirect_request(page, None, 301, "Moved", {}, "http://jobs.acme.example/")
+        self.assertEqual(onward.full_url, "https://jobs.acme.example/")
+        for target, refusal in (("http://www.acme.example/jobs", fetch._PlainHTTP),
+                                ("https://lnkd.in/abc", fetch._NotRead),
+                                ("https://uk.linkedin.com/jobs/view/1", fetch._NotRead),
+                                ("ftp://acme.example/", fetch._NotWeb)):
+            with self.assertRaises(refusal, msg=target):
+                handler.redirect_request(page, None, 302, "Found", {}, target)
+
+    def test_platforms_never_read_under_any_address(self):
+        for host in ("www.linkedin.com", "uk.linkedin.com", "lnkd.in", "www.glassdoor.co.uk",
+                     "uk.indeed.com", "www.ziprecruiter.co.uk", "builtin.com", "www.dice.com"):
+            self.assertTrue(fetch.not_read_reason(host), host)
+        for host in ("acme.example", "notlinkedin.example", "linkedin-jobs.example", "dice.example"):
+            self.assertIsNone(fetch.not_read_reason(host), host)
+        self.assertEqual(fetch.get("https://lnkd.in/abc")[2], "refused:not_read")
+
 
 class Pages(unittest.TestCase):
     def test_listing_links(self):
@@ -164,6 +222,40 @@ class Pages(unittest.TestCase):
         self.assertEqual(listing.clean_domain("https://www.Acme.example/careers"), "www.acme.example")
         self.assertIsNone(listing.clean_domain("-bad"))
         self.assertIsNone(listing.clean_domain("not a domain"))
+
+    def test_hosts(self):
+        self.assertEqual(listing.host_of("https://WWW.Acme.Example:8443/x"), "acme.example")
+        self.assertEqual(listing.host_of("https://awww.example/"), "awww.example")
+        self.assertEqual(listing.host_of("https://[::1"), "")
+
+    def test_malformed_links_are_skipped(self):
+        page = '<a href="http://[careers">bad</a><a href="/careers">good</a>'
+        self.assertEqual(checks._harvest(page, "https://acme.example"), ["https://acme.example/careers"])
+
+    def test_a_site_that_only_serves_plain_http(self):
+        with mock.patch.object(checks, "get", lambda url, timeout=15: ("", url, "refused:plain_http")):
+            careers = checks.check_careers("acme.example", "Security Analyst")
+        self.assertEqual((careers["value"], careers["status"]), ("plain_http_only", "unavailable"))
+
+
+class LinksThatRedirect(unittest.TestCase):
+    def test_a_link_that_leads_to_a_platform_never_read(self):
+        # Refused by get(), or followed by some other get() that did not refuse it.
+        for get in (lands_on("https://www.linkedin.com/jobs/view/1", "refused:not_read"),
+                    lands_on("https://www.linkedin.com/jobs/view/1", 200,
+                             '<a href="https://www.acme.example/">Acme</a>')):
+            with mock.patch.object(listing, "get", get):
+                result = listing.check_listing(url="https://short.example/abc")
+            self.assertEqual(result["error"]["code"], "not_read")
+            self.assertIn("leads to linkedin.com", result["error"]["message"])
+            self.assertEqual(result["fields"], {})
+
+    def test_the_site_a_link_lands_on_is_not_the_employer(self):
+        page = ('<a href="https://jobs.aggregator.example/">Jobs</a>' * 4
+                + '<a href="https://www.acme.example/">Acme</a>')
+        with mock.patch.object(listing, "get", lands_on("https://jobs.aggregator.example/p/1", 200, page)):
+            found = listing.employer_domain_from_page("https://go.redirect.example/j/1")
+        self.assertEqual(found[0], "acme.example")
 
 
 ACME = {

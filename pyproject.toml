@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "reqcheck"
+version = "0.1.0"
+description = "Check a job listing against the employer's own careers page, using public sources."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "AGPL-3.0-or-later OR PolyForm-Noncommercial-1.0.0" }
+authors = [{ name = "The reqcheck authors" }]
+dependencies = []
+
+[project.optional-dependencies]
+certifi = ["certifi"]
+
+[project.scripts]
+reqcheck = "reqcheck.cli:main"
+
+[tool.setuptools]
+packages = ["reqcheck"]
